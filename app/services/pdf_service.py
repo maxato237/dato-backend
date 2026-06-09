@@ -16,7 +16,53 @@ from reportlab.platypus import (
 )
 from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER
 
+from reportlab.platypus import Flowable
+
 from app.models.quote import Quote
+
+
+class _BackgroundCard(Flowable):
+    """Flowable ReportLab : image de fond + voile semi-transparent + table de contenu.
+
+    Le contenu (inner_table) détermine la hauteur du bloc.
+    L'image remplit toute la surface (preserveAspectRatio=False → rognage côté PDF).
+    """
+    _PAD_H = 10  # padding horizontal interne (pts)
+    _PAD_V = 8   # padding vertical interne (pts)
+
+    def __init__(self, inner_table, bg_data: bytes, overlay_alpha: float = 0.48):
+        Flowable.__init__(self)
+        self._table = inner_table
+        self._bg = bg_data
+        self._alpha = overlay_alpha
+        self._w = self._h = self._table_h = 0
+
+    def wrap(self, avail_w, avail_h):
+        self._w = avail_w
+        inner_w = avail_w - 2 * self._PAD_H
+        _, self._table_h = self._table.wrap(inner_w, avail_h)
+        self._h = self._table_h + 2 * self._PAD_V
+        return self._w, self._h
+
+    def draw(self):
+        c = self.canv
+        w, h = self._w, self._h
+
+        # Image de fond : remplit toute la surface (sans déformation).
+        c.drawImage(
+            ImageReader(io.BytesIO(self._bg)),
+            0, 0, w, h,
+            preserveAspectRatio=False,
+            mask='auto',
+        )
+        # Voile sombre pour la lisibilité du texte blanc.
+        if self._alpha > 0:
+            c.setFillColor(colors.Color(0, 0, 0, alpha=self._alpha))
+            c.rect(0, 0, w, h, fill=1, stroke=0)
+
+        # Table par-dessus : dans le repère ReportLab (y=0 en bas),
+        # le haut de la table est à h - PAD_V depuis le bas du bloc.
+        self._table.drawOn(c, self._PAD_H, h - self._PAD_V)
 
 
 def _load_image_bytes(url):
@@ -100,8 +146,7 @@ def generate_quote_pdf(quote: Quote) -> bytes:
     styles = getSampleStyleSheet()
     story = []
 
-    _add_cover_image(story, quote)
-    _add_header(story, quote, styles)
+    _add_header(story, quote, styles)  # l'image d'en-tête est maintenant le fond du cadre
     story.append(Spacer(1, 6 * mm))
     _add_parties(story, quote, styles)
     story.append(Spacer(1, 6 * mm))
@@ -126,29 +171,28 @@ def _style(name, **kw):
     return s
 
 
-def _add_cover_image(story, quote: Quote):
-    """Bannière de couverture en haut du devis (si l'entreprise en a une)."""
-    data = _load_image_bytes(getattr(quote.company, 'header_image_url', None))
-    if not data:
-        return
-    img = _fitted_image(data, PAGE_W - 2 * MARGIN, 35 * mm)
-    if img is not None:
-        img.hAlign = 'CENTER'
-        story.append(img)
-        story.append(Spacer(1, 5 * mm))
-
-
 def _add_header(story, quote: Quote, styles):
     company = quote.company
     status_color = _STATUS_COLORS.get(quote.status, _MUTED)
     status_label = _STATUS_LABELS.get(quote.status, quote.status)
 
-    company_name_style = _style('CompanyName', fontSize=18, fontName='Helvetica-Bold', textColor=_INK)
-    activity_style = _style('Activity', fontSize=9, textColor=_MUTED)
-    quote_title_style = _style('QuoteTitle', fontSize=14, fontName='Helvetica-Bold', textColor=_ACCENT, alignment=TA_RIGHT)
-    quote_num_style = _style('QuoteNum', fontSize=9, textColor=_MUTED, alignment=TA_RIGHT)
+    # Image de fond du cadre entreprise (optionnelle).
+    header_bg = _load_image_bytes(getattr(company, 'header_image_url', None))
+    has_bg = header_bg is not None
 
-    # Logo : affiché uniquement s'il a été uploadé (sinon rien — pas de carré vide).
+    # Couleurs adaptatives : blanc sur fond image, sombres sans fond.
+    txt_name  = _WHITE if has_bg else _INK
+    txt_sub   = colors.Color(1, 1, 1, alpha=0.88) if has_bg else _MUTED
+    txt_quote = _WHITE if has_bg else _ACCENT
+    txt_num   = colors.Color(1, 1, 1, alpha=0.78) if has_bg else _MUTED
+    txt_st    = _WHITE if has_bg else _MUTED
+
+    name_style  = _style('CompanyName', fontSize=18, fontName='Helvetica-Bold', textColor=txt_name)
+    act_style   = _style('Activity', fontSize=9, textColor=txt_sub)
+    title_style = _style('QuoteTitle', fontSize=14, fontName='Helvetica-Bold', textColor=txt_quote, alignment=TA_RIGHT)
+    num_style   = _style('QuoteNum', fontSize=9, textColor=txt_num, alignment=TA_RIGHT)
+
+    # Logo : affiché uniquement s'il a été uploadé.
     left_col = []
     logo_data = _load_image_bytes(getattr(company, 'logo_url', None))
     if logo_data:
@@ -159,29 +203,39 @@ def _add_header(story, quote: Quote, styles):
             left_col.append(Spacer(1, 3 * mm))
 
     left_col += [
-        Paragraph(company.name, company_name_style),
-        Paragraph(company.activity or '', activity_style),
-        Paragraph(', '.join(company.phones or []), activity_style),
-        Paragraph(' — '.join(p for p in [company.address, company.city] if p), activity_style),
+        Paragraph(company.name, name_style),
+        Paragraph(company.activity or '', act_style),
+        Paragraph(', '.join(company.phones or []), act_style),
+        Paragraph(' — '.join(p for p in [company.address, company.city] if p), act_style),
     ]
     right_col = [
-        Paragraph(f'<font color="#{_hex(status_color)}">● {status_label}</font>', _style('s', fontSize=9, alignment=TA_RIGHT)),
+        Paragraph(
+            f'<font color="#{_hex(status_color)}">● {status_label}</font>',
+            _style('s', fontSize=9, alignment=TA_RIGHT, textColor=txt_st),
+        ),
         Spacer(1, 2 * mm),
-        Paragraph('DEVIS', quote_title_style),
-        Paragraph(quote.number, quote_num_style),
-        Paragraph(f'Émis le {date.today().strftime("%d/%m/%Y")}', quote_num_style),
-        Paragraph(f'Valide {quote.validity_days} jours', quote_num_style),
+        Paragraph('DEVIS', title_style),
+        Paragraph(quote.number, num_style),
+        Paragraph(f'Émis le {date.today().strftime("%d/%m/%Y")}', num_style),
+        Paragraph(f'Valide {quote.validity_days} jours', num_style),
     ]
 
-    header_table = Table(
+    content_w = PAGE_W - 2 * MARGIN
+    inner = Table(
         [[left_col, right_col]],
-        colWidths=[(PAGE_W - 2 * MARGIN) * 0.55, (PAGE_W - 2 * MARGIN) * 0.45],
+        colWidths=[content_w * 0.55, content_w * 0.45],
     )
-    header_table.setStyle(TableStyle([
+    inner.setStyle(TableStyle([
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
         ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
     ]))
-    story.append(header_table)
+
+    if has_bg:
+        # Image rognée = fond du cadre, texte blanc par-dessus.
+        story.append(_BackgroundCard(inner, bg_data=header_bg, overlay_alpha=0.50))
+    else:
+        story.append(inner)
+
     story.append(HRFlowable(width='100%', thickness=1, color=_BORDER, spaceAfter=0))
 
 
@@ -308,35 +362,54 @@ def _add_signatures(story, sigs, styles):
 def _add_footer(story, quote: Quote, styles):
     company = quote.company
     content_w = PAGE_W - 2 * MARGIN
-
-    # Bannière de pied de page « designée comme l'en-tête » :
-    # 1) image uploadée (texture « Situé à … ») si présente, sinon
-    # 2) bandeau coloré avec le texte de localisation si renseigné.
-    footer_img_data = _load_image_bytes(getattr(company, 'footer_image_url', None))
     location = (getattr(company, 'location', None) or '').strip()
+    footer_bg = _load_image_bytes(getattr(company, 'footer_image_url', None))
 
-    if footer_img_data:
+    if footer_bg or location:
         story.append(Spacer(1, 8 * mm))
-        img = _fitted_image(footer_img_data, content_w, 28 * mm)
-        if img is not None:
-            img.hAlign = 'CENTER'
-            story.append(img)
-    elif location:
-        story.append(Spacer(1, 8 * mm))
-        banner_style = _style(
-            'FooterBanner', fontSize=11, fontName='Helvetica-Bold',
-            textColor=_WHITE, alignment=TA_CENTER, leading=14,
-        )
-        banner = Table([[Paragraph(location, banner_style)]], colWidths=[content_w])
-        banner.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, -1), _INK),
-            ('TOPPADDING', (0, 0), (-1, -1), 8),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-            ('LEFTPADDING', (0, 0), (-1, -1), 10),
-            ('RIGHTPADDING', (0, 0), (-1, -1), 10),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ]))
-        story.append(banner)
+
+        if footer_bg:
+            # Image rognée = fond du cadre footer.  Si localisation renseignée,
+            # le texte blanc s'affiche par-dessus avec un voile sombre.
+            if location:
+                loc_style = _style(
+                    'FooterLoc', fontSize=11, fontName='Helvetica-Bold',
+                    textColor=_WHITE, alignment=TA_CENTER, leading=14,
+                )
+                inner = Table(
+                    [[Paragraph(location, loc_style)]],
+                    colWidths=[content_w],
+                )
+                inner.setStyle(TableStyle([
+                    ('TOPPADDING',    (0, 0), (-1, -1), 8),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+                    ('LEFTPADDING',   (0, 0), (-1, -1), 10),
+                    ('RIGHTPADDING',  (0, 0), (-1, -1), 10),
+                ]))
+                story.append(_BackgroundCard(inner, bg_data=footer_bg, overlay_alpha=0.45))
+            else:
+                # Juste l'image, hauteur fixe via un Spacer.
+                inner = Table(
+                    [[Spacer(content_w, 28 * mm)]],
+                    colWidths=[content_w],
+                )
+                story.append(_BackgroundCard(inner, bg_data=footer_bg, overlay_alpha=0.0))
+        else:
+            # Pas d'image : bandeau coloré classique avec le texte.
+            banner_style = _style(
+                'FooterBanner', fontSize=11, fontName='Helvetica-Bold',
+                textColor=_WHITE, alignment=TA_CENTER, leading=14,
+            )
+            banner = Table([[Paragraph(location, banner_style)]], colWidths=[content_w])
+            banner.setStyle(TableStyle([
+                ('BACKGROUND',    (0, 0), (-1, -1), _INK),
+                ('TOPPADDING',    (0, 0), (-1, -1), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+                ('LEFTPADDING',   (0, 0), (-1, -1), 10),
+                ('RIGHTPADDING',  (0, 0), (-1, -1), 10),
+                ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
+            ]))
+            story.append(banner)
 
     # Mention discrète DATO sous la bannière.
     story.append(Spacer(1, 4 * mm))
