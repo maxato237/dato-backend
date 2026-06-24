@@ -13,6 +13,9 @@ class BaseConfig:
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     CORS_ORIGINS = os.getenv('CORS_ORIGINS', '*').split(',')
     OTP_EXPIRES_SECONDS = 600  # 10 minutes
+    # Mettre REQUIRE_OTP=1 dans l'env quand Twilio est configuré.
+    # Par défaut False : inscription directement vérifiée, pas d'OTP envoyé.
+    REQUIRE_OTP = os.getenv('REQUIRE_OTP', '0') == '1'
 
     # Upload d'images (logo, couverture d'en-tête, bannière de pied de page).
     UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', os.path.join(_BASE_DIR, 'uploads'))
@@ -38,6 +41,7 @@ class TestingConfig(BaseConfig):
     TESTING = True
     SQLALCHEMY_DATABASE_URI = 'sqlite:///:memory:?check_same_thread=False'
     OTP_IN_RESPONSE = True
+    REQUIRE_OTP = True  # tests gardent le flux OTP complet (pas de vrai SMS)
     JWT_ACCESS_TOKEN_EXPIRES = 3600
     JWT_REFRESH_TOKEN_EXPIRES = 2592000
     # Uploads isolés dans un dossier temporaire (n'altère pas backend/uploads).

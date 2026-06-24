@@ -1,4 +1,4 @@
-"""Génération PDF des devis DATO avec ReportLab."""
+"""Génération PDF des devis DATO avec ReportLab (fallback sans template Word)."""
 import io
 import os
 from datetime import date, timedelta
@@ -16,62 +16,15 @@ from reportlab.platypus import (
 )
 from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER
 
-from reportlab.platypus import Flowable
-
 from app.models.quote import Quote
 
 
-class _BackgroundCard(Flowable):
-    """Flowable ReportLab : image de fond + voile semi-transparent + table de contenu.
+def _load_file_bytes(url: str | None) -> bytes | None:
+    """Retourne les octets d'un fichier (local ou distant) ou None.
 
-    Le contenu (inner_table) détermine la hauteur du bloc.
-    L'image remplit toute la surface (preserveAspectRatio=False → rognage côté PDF).
-    """
-    _PAD_H = 10  # padding horizontal interne (pts)
-    _PAD_V = 8   # padding vertical interne (pts)
-
-    def __init__(self, inner_table, bg_data: bytes, overlay_alpha: float = 0.48):
-        Flowable.__init__(self)
-        self._table = inner_table
-        self._bg = bg_data
-        self._alpha = overlay_alpha
-        self._w = self._h = self._table_h = 0
-
-    def wrap(self, avail_w, avail_h):
-        self._w = avail_w
-        inner_w = avail_w - 2 * self._PAD_H
-        _, self._table_h = self._table.wrap(inner_w, avail_h)
-        self._h = self._table_h + 2 * self._PAD_V
-        return self._w, self._h
-
-    def draw(self):
-        c = self.canv
-        w, h = self._w, self._h
-
-        # Image de fond : remplit toute la surface (sans déformation).
-        c.drawImage(
-            ImageReader(io.BytesIO(self._bg)),
-            0, 0, w, h,
-            preserveAspectRatio=False,
-            mask='auto',
-        )
-        # Voile sombre pour la lisibilité du texte blanc.
-        if self._alpha > 0:
-            c.setFillColor(colors.Color(0, 0, 0, alpha=self._alpha))
-            c.rect(0, 0, w, h, fill=1, stroke=0)
-
-        # Table par-dessus : dans le repère ReportLab (y=0 en bas),
-        # le haut de la table est à h - PAD_V depuis le bas du bloc.
-        self._table.drawOn(c, self._PAD_H, h - self._PAD_V)
-
-
-def _load_image_bytes(url):
-    """Retourne les octets d'une image (locale ou distante) ou None.
-
-    - URL Supabase / http(s) : récupération via HTTP.
-    - URL locale (.../uploads/<f>) servie par ce backend : lecture directe sur
-      disque (plus rapide, pas d'appel réseau).
-    Échec silencieux (réseau, 404…) → None, le PDF se construit sans l'image.
+    - URL locale (.../uploads/<f>) : lecture directe sur disque.
+    - URL http(s) (Supabase…) : récupération via HTTP.
+    Échec silencieux → None.
     """
     if not url:
         return None
@@ -92,6 +45,10 @@ def _load_image_bytes(url):
         except requests.RequestException:
             return None
     return None
+
+
+# Alias utilisé dans _add_header pour charger le logo.
+_load_image_bytes = _load_file_bytes
 
 
 def _fitted_image(data, max_w, max_h):
@@ -133,6 +90,26 @@ MARGIN = 20 * mm
 
 
 def generate_quote_pdf(quote: Quote) -> bytes:
+    """Génère le PDF du devis.
+
+    Si l'entreprise a un modèle Word (.docx) configuré, on l'utilise pour
+    préserver l'en-tête et le pied de page d'origine.
+    Sinon, génération ReportLab classique.
+    """
+    template_url = getattr(quote.company, 'template_docx_url', None)
+    if template_url:
+        try:
+            from app.services.docx_template_service import fill_quote_template, docx_to_pdf
+            template_bytes = _load_file_bytes(template_url)
+            if template_bytes:
+                filled = fill_quote_template(template_bytes, quote)
+                return docx_to_pdf(filled)
+        except Exception as exc:
+            current_app.logger.warning(
+                'Génération PDF via template DOCX échouée (%s) — fallback ReportLab.', exc
+            )
+
+    # ── Fallback ReportLab ────────────────────────────────────────────────────
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -146,7 +123,7 @@ def generate_quote_pdf(quote: Quote) -> bytes:
     styles = getSampleStyleSheet()
     story = []
 
-    _add_header(story, quote, styles)  # l'image d'en-tête est maintenant le fond du cadre
+    _add_header(story, quote, styles)
     story.append(Spacer(1, 6 * mm))
     _add_parties(story, quote, styles)
     story.append(Spacer(1, 6 * mm))
@@ -171,28 +148,39 @@ def _style(name, **kw):
     return s
 
 
+# Caractères Unicode hors du jeu WinAnsiEncoding de Helvetica.
+# ReportLab les rend en rectangle vide si on ne les substitue pas.
+_CHAR_MAP = str.maketrans({
+    'œ': 'oe',   # œ → oe
+    'Œ': 'OE',   # Œ → OE
+    'æ': 'ae',   # æ → ae
+    'Æ': 'AE',   # Æ → AE
+    '’': "'",    # ' (guillemet apostrophe)
+    '‘': "'",    # ' (guillemet ouvert)
+    '“': '"',    # "
+    '”': '"',    # "
+    '–': '-',    # – (tiret demi-cadratin)
+    '—': '--',   # — (tiret cadratin)
+    '…': '...',  # …
+})
+
+
+def _t(text: str | None) -> str:
+    """Normalise un texte pour la police Helvetica (ReportLab fallback)."""
+    return (text or '').translate(_CHAR_MAP)
+
+
 def _add_header(story, quote: Quote, styles):
     company = quote.company
     status_color = _STATUS_COLORS.get(quote.status, _MUTED)
     status_label = _STATUS_LABELS.get(quote.status, quote.status)
 
-    # Image de fond du cadre entreprise (optionnelle).
-    header_bg = _load_image_bytes(getattr(company, 'header_image_url', None))
-    has_bg = header_bg is not None
+    name_style  = _style('CompanyName', fontSize=18, fontName='Helvetica-Bold', textColor=_INK)
+    act_style   = _style('Activity', fontSize=9, textColor=_MUTED)
+    title_style = _style('QuoteTitle', fontSize=14, fontName='Helvetica-Bold', textColor=_ACCENT, alignment=TA_RIGHT)
+    num_style   = _style('QuoteNum', fontSize=9, textColor=_MUTED, alignment=TA_RIGHT)
 
-    # Couleurs adaptatives : blanc sur fond image, sombres sans fond.
-    txt_name  = _WHITE if has_bg else _INK
-    txt_sub   = colors.Color(1, 1, 1, alpha=0.88) if has_bg else _MUTED
-    txt_quote = _WHITE if has_bg else _ACCENT
-    txt_num   = colors.Color(1, 1, 1, alpha=0.78) if has_bg else _MUTED
-    txt_st    = _WHITE if has_bg else _MUTED
-
-    name_style  = _style('CompanyName', fontSize=18, fontName='Helvetica-Bold', textColor=txt_name)
-    act_style   = _style('Activity', fontSize=9, textColor=txt_sub)
-    title_style = _style('QuoteTitle', fontSize=14, fontName='Helvetica-Bold', textColor=txt_quote, alignment=TA_RIGHT)
-    num_style   = _style('QuoteNum', fontSize=9, textColor=txt_num, alignment=TA_RIGHT)
-
-    # Logo : affiché uniquement s'il a été uploadé.
+    # Logo (optionnel).
     left_col = []
     logo_data = _load_image_bytes(getattr(company, 'logo_url', None))
     if logo_data:
@@ -203,15 +191,15 @@ def _add_header(story, quote: Quote, styles):
             left_col.append(Spacer(1, 3 * mm))
 
     left_col += [
-        Paragraph(company.name, name_style),
-        Paragraph(company.activity or '', act_style),
+        Paragraph(_t(company.name), name_style),
+        Paragraph(_t(company.activity), act_style),
         Paragraph(', '.join(company.phones or []), act_style),
-        Paragraph(' — '.join(p for p in [company.address, company.city] if p), act_style),
+        Paragraph(_t(' — '.join(p for p in [company.address, company.city] if p)), act_style),
     ]
     right_col = [
         Paragraph(
             f'<font color="#{_hex(status_color)}">● {status_label}</font>',
-            _style('s', fontSize=9, alignment=TA_RIGHT, textColor=txt_st),
+            _style('s', fontSize=9, alignment=TA_RIGHT, textColor=_MUTED),
         ),
         Spacer(1, 2 * mm),
         Paragraph('DEVIS', title_style),
@@ -229,13 +217,7 @@ def _add_header(story, quote: Quote, styles):
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
         ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
     ]))
-
-    if has_bg:
-        # Image rognée = fond du cadre, texte blanc par-dessus.
-        story.append(_BackgroundCard(inner, bg_data=header_bg, overlay_alpha=0.50))
-    else:
-        story.append(inner)
-
+    story.append(inner)
     story.append(HRFlowable(width='100%', thickness=1, color=_BORDER, spaceAfter=0))
 
 
@@ -247,13 +229,13 @@ def _add_parties(story, quote: Quote, styles):
     client = quote.client
     client_lines = [Paragraph('CLIENT', label_style)]
     if client:
-        client_lines.append(Paragraph(client.name, value_style))
+        client_lines.append(Paragraph(_t(client.name), value_style))
         if client.phone:
-            client_lines.append(Paragraph(client.phone, sub_style))
+            client_lines.append(Paragraph(_t(client.phone), sub_style))
         if client.email:
             client_lines.append(Paragraph(client.email, sub_style))
         if client.address:
-            client_lines.append(Paragraph(client.address, sub_style))
+            client_lines.append(Paragraph(_t(client.address), sub_style))
     else:
         client_lines.append(Paragraph('—', value_style))
 
@@ -261,7 +243,7 @@ def _add_parties(story, quote: Quote, styles):
     meta_lines = [
         Paragraph('DÉTAILS', label_style),
         Paragraph(f'N° {quote.number}', value_style),
-        Paragraph(f'Titre : {quote.title}', sub_style),
+        Paragraph(f'Titre : {_t(quote.title)}', sub_style),
         Paragraph(f'Expire le {expiry.strftime("%d/%m/%Y")}', sub_style),
         Paragraph(f'Devise : {quote.company.currency}', sub_style),
     ]
@@ -281,7 +263,7 @@ def _add_items_table(story, quote: Quote, styles):
     rows = [headers]
     for item in quote.items:
         rows.append([
-            item.description + (f'\n({item.unit})' if item.unit else ''),
+            _t(item.description) + (f'\n({_t(item.unit)})' if item.unit else ''),
             f'{item.quantity:g}',
             f'{item.unit_price:,.0f}',
             f'{item.total:,.0f}',
@@ -340,7 +322,7 @@ def _add_totals(story, quote: Quote, styles):
 def _add_notes(story, quote: Quote, styles):
     story.append(Paragraph('Notes', _style('NL', fontSize=8, fontName='Helvetica-Bold', textColor=_MUTED)))
     story.append(Spacer(1, 2 * mm))
-    story.append(Paragraph(quote.notes, _style('NT', fontSize=9, textColor=_INK)))
+    story.append(Paragraph(_t(quote.notes), _style('NT', fontSize=9, textColor=_INK)))
 
 
 def _add_signatures(story, sigs, styles):
@@ -363,55 +345,26 @@ def _add_footer(story, quote: Quote, styles):
     company = quote.company
     content_w = PAGE_W - 2 * MARGIN
     location = (getattr(company, 'location', None) or '').strip()
-    footer_bg = _load_image_bytes(getattr(company, 'footer_image_url', None))
 
-    if footer_bg or location:
+    # Bandeau de localisation (texte uniquement).
+    if location:
         story.append(Spacer(1, 8 * mm))
+        banner_style = _style(
+            'FooterBanner', fontSize=11, fontName='Helvetica-Bold',
+            textColor=_WHITE, alignment=TA_CENTER, leading=14,
+        )
+        banner = Table([[Paragraph(_t(location), banner_style)]], colWidths=[content_w])
+        banner.setStyle(TableStyle([
+            ('BACKGROUND',    (0, 0), (-1, -1), _INK),
+            ('TOPPADDING',    (0, 0), (-1, -1), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ('LEFTPADDING',   (0, 0), (-1, -1), 10),
+            ('RIGHTPADDING',  (0, 0), (-1, -1), 10),
+            ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+        story.append(banner)
 
-        if footer_bg:
-            # Image rognée = fond du cadre footer.  Si localisation renseignée,
-            # le texte blanc s'affiche par-dessus avec un voile sombre.
-            if location:
-                loc_style = _style(
-                    'FooterLoc', fontSize=11, fontName='Helvetica-Bold',
-                    textColor=_WHITE, alignment=TA_CENTER, leading=14,
-                )
-                inner = Table(
-                    [[Paragraph(location, loc_style)]],
-                    colWidths=[content_w],
-                )
-                inner.setStyle(TableStyle([
-                    ('TOPPADDING',    (0, 0), (-1, -1), 8),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-                    ('LEFTPADDING',   (0, 0), (-1, -1), 10),
-                    ('RIGHTPADDING',  (0, 0), (-1, -1), 10),
-                ]))
-                story.append(_BackgroundCard(inner, bg_data=footer_bg, overlay_alpha=0.45))
-            else:
-                # Juste l'image, hauteur fixe via un Spacer.
-                inner = Table(
-                    [[Spacer(content_w, 28 * mm)]],
-                    colWidths=[content_w],
-                )
-                story.append(_BackgroundCard(inner, bg_data=footer_bg, overlay_alpha=0.0))
-        else:
-            # Pas d'image : bandeau coloré classique avec le texte.
-            banner_style = _style(
-                'FooterBanner', fontSize=11, fontName='Helvetica-Bold',
-                textColor=_WHITE, alignment=TA_CENTER, leading=14,
-            )
-            banner = Table([[Paragraph(location, banner_style)]], colWidths=[content_w])
-            banner.setStyle(TableStyle([
-                ('BACKGROUND',    (0, 0), (-1, -1), _INK),
-                ('TOPPADDING',    (0, 0), (-1, -1), 8),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-                ('LEFTPADDING',   (0, 0), (-1, -1), 10),
-                ('RIGHTPADDING',  (0, 0), (-1, -1), 10),
-                ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
-            ]))
-            story.append(banner)
-
-    # Mention discrète DATO sous la bannière.
+    # Mention discrète DATO.
     story.append(Spacer(1, 4 * mm))
     story.append(HRFlowable(width='100%', thickness=0.5, color=_BORDER))
     story.append(Spacer(1, 2 * mm))

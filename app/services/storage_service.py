@@ -26,6 +26,13 @@ _CONTENT_TYPES = {
     'webp': 'image/webp',
 }
 
+# Types MIME Office forcés côté serveur (le client peut envoyer un type
+# incohérent). Le bucket Supabase doit les autoriser (allowed_mime_types).
+_OFFICE_TYPES = {
+    'doc': 'application/msword',
+    'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+}
+
 
 def supabase_enabled() -> bool:
     return bool(
@@ -34,13 +41,24 @@ def supabase_enabled() -> bool:
     )
 
 
-def save_image(file_storage, ext: str) -> str:
-    """Persiste un fichier (Werkzeug FileStorage) et retourne son URL publique."""
-    filename = f'{uuid.uuid4().hex}.{ext}'
+def save_image(file_storage, ext: str, folder: str = 'uploads') -> str:
+    """Persiste un fichier (Werkzeug FileStorage) et retourne son URL publique.
+
+    Args:
+        file_storage: objet Werkzeug FileStorage.
+        ext: extension du fichier sans le point (ex. 'png', 'docx').
+        folder: sous-dossier de stockage ('logos', 'templates', …).
+                Évite de mélanger images et documents dans le même répertoire.
+    """
+    filename = f'{folder}/{uuid.uuid4().hex}.{ext}'
     data = file_storage.read()
     content_type = file_storage.mimetype or _CONTENT_TYPES.get(
         ext, 'application/octet-stream'
     )
+    # On force le vrai type MIME Office pour .doc/.docx (déterministe). Le
+    # bucket Supabase doit l'autoriser via allowed_mime_types.
+    if ext in _OFFICE_TYPES:
+        content_type = _OFFICE_TYPES[ext]
 
     if supabase_enabled():
         return _upload_to_supabase(filename, data, content_type)
@@ -78,8 +96,9 @@ def _upload_to_supabase(filename: str, data: bytes, content_type: str) -> str:
 
 
 def _save_local(filename: str, data: bytes) -> str:
-    folder = current_app.config['UPLOAD_FOLDER']
-    os.makedirs(folder, exist_ok=True)
-    with open(os.path.join(folder, filename), 'wb') as fh:
+    root = current_app.config['UPLOAD_FOLDER']
+    dest = os.path.join(root, filename)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, 'wb') as fh:
         fh.write(data)
     return f"{request.host_url.rstrip('/')}/uploads/{filename}"

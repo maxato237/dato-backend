@@ -26,6 +26,12 @@ class Quote(db.Model):
     tax_amount = db.Column(db.Numeric(14, 2), nullable=False, default=0)
     total = db.Column(db.Numeric(14, 2), nullable=False, default=0)
     share_token = db.Column(db.UUID(as_uuid=True), unique=True, nullable=False, default=uuid.uuid4, index=True)
+    # Lien public révocable : la vue publique renvoie 404 si False.
+    share_enabled = db.Column(db.Boolean, nullable=False, default=True)
+    # Snapshot JSON du devis riche tel que l'app le modélise (sections + rubriques
+    # forfait/formule, montant en lettres). Source de vérité de la vue publique ;
+    # les colonnes plates ci-dessus servent aux listes/stats serveur.
+    document_json = db.Column(db.JSON, nullable=True)
     sent_at = db.Column(db.DateTime(timezone=True), nullable=True)
     created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = db.Column(
@@ -59,6 +65,7 @@ class Quote(db.Model):
             'tax_amount': float(self.tax_amount),
             'total': float(self.total),
             'share_token': str(self.share_token),
+            'share_enabled': self.share_enabled,
             'sent_at': self.sent_at.isoformat() if self.sent_at else None,
             'created_at': self.created_at.isoformat(),
             'updated_at': self.updated_at.isoformat(),
@@ -66,6 +73,7 @@ class Quote(db.Model):
         }
         if include_items:
             data['items'] = [i.to_dict() for i in self.items]
+            data['document_json'] = self.document_json
         return data
 
 

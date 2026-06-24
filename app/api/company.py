@@ -4,7 +4,7 @@ from app.extensions import db
 from app.models.company import Company, Signature
 from app.schemas.company import CompanySchema, SignatureSchema
 from app.utils.auth import login_required
-from app.utils.errors import NotFoundError, ForbiddenError
+from app.utils.errors import NotFoundError, ForbiddenError, ApiError
 from app.utils.responses import success, created, no_content
 
 company_bp = Blueprint('company', __name__)
@@ -46,6 +46,50 @@ def update_company():
         setattr(company, key, value)
     db.session.commit()
     return success(data=company.to_dict(include_signatures=True))
+
+
+# ── Modèle Word (.docx) ────────────────────────────────────────────────────
+
+@company_bp.post('/template')
+@login_required
+def upload_template():
+    """Upload du modèle Word (.doc/.docx) utilisé pour générer les PDF de devis.
+
+    Accepte uniquement les fichiers .doc et .docx.
+    Sauvegarde le fichier via storage_service et met à jour company.template_docx_url.
+    """
+    if 'file' not in request.files:
+        raise ApiError('Aucun fichier fourni (champ « file » manquant).', 400)
+
+    file = request.files['file']
+    if not file or not file.filename:
+        raise ApiError('Fichier vide.', 400)
+
+    ext = file.filename.rsplit('.', 1)[-1].lower() if '.' in file.filename else ''
+    if ext not in {'doc', 'docx'}:
+        raise ApiError(
+            'Format non supporté. Seuls les fichiers .doc et .docx sont acceptés.', 400
+        )
+
+    company = _get_company_or_404(g.current_user)
+
+    from app.services.storage_service import save_image
+    url = save_image(file, ext, folder='templates')
+
+    company.template_docx_url = url
+    db.session.commit()
+
+    return success(data={'url': url, 'template_docx_url': url})
+
+
+@company_bp.delete('/template')
+@login_required
+def delete_template():
+    """Retire le modèle Word de l'entreprise (remet template_docx_url à NULL)."""
+    company = _get_company_or_404(g.current_user)
+    company.template_docx_url = None
+    db.session.commit()
+    return no_content()
 
 
 # ── Signatures ─────────────────────────────────────────────────────────────

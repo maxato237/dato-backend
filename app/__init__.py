@@ -78,9 +78,10 @@ def _ensure_dev_columns(app):
     statements = [
         'ALTER TABLE companies ADD COLUMN IF NOT EXISTS address VARCHAR(200)',
         'ALTER TABLE companies ADD COLUMN IF NOT EXISTS logo_url VARCHAR(500)',
-        'ALTER TABLE companies ADD COLUMN IF NOT EXISTS header_image_url VARCHAR(500)',
-        'ALTER TABLE companies ADD COLUMN IF NOT EXISTS footer_image_url VARCHAR(500)',
         'ALTER TABLE companies ADD COLUMN IF NOT EXISTS location VARCHAR(300)',
+        'ALTER TABLE companies ADD COLUMN IF NOT EXISTS template_docx_url VARCHAR(500)',
+        'ALTER TABLE quotes ADD COLUMN IF NOT EXISTS share_enabled BOOLEAN NOT NULL DEFAULT TRUE',
+        'ALTER TABLE quotes ADD COLUMN IF NOT EXISTS document_json JSON',
     ]
     for stmt in statements:
         try:

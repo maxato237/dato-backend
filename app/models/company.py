@@ -15,12 +15,10 @@ class Company(db.Model):
     phones = db.Column(db.JSON, nullable=False, default=list)
     currency = db.Column(db.String(10), nullable=False, default='FCFA')
     logo_url = db.Column(db.String(500), nullable=True)
-    # Image de couverture affichée en haut du devis (bannière d'en-tête).
-    header_image_url = db.Column(db.String(500), nullable=True)
-    # Bannière de pied de page (ex. image texturée « Situé à … »).
-    footer_image_url = db.Column(db.String(500), nullable=True)
-    # Texte de localisation affiché dans la bannière de pied de page.
+    # Texte de localisation affiché dans le pied de page.
     location = db.Column(db.String(300), nullable=True)
+    # URL du modèle Word (.docx) utilisé pour générer les PDF de devis.
+    template_docx_url = db.Column(db.String(500), nullable=True)
     created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = db.Column(
         db.DateTime(timezone=True),
@@ -47,9 +45,8 @@ class Company(db.Model):
             'phones': self.phones or [],
             'currency': self.currency,
             'logo_url': self.logo_url,
-            'header_image_url': self.header_image_url,
-            'footer_image_url': self.footer_image_url,
             'location': self.location,
+            'template_docx_url': self.template_docx_url,
             'created_at': self.created_at.isoformat(),
             'updated_at': self.updated_at.isoformat(),
         }

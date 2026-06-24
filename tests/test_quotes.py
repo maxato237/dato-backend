@@ -99,6 +99,96 @@ class TestQuoteCrud:
         assert copy['total'] == q['total']
 
 
+class TestPublicShare:
+    def test_public_view_accessible_without_auth(self, client):
+        headers = _setup_user_with_company(client)
+        q = client.post('/api/quotes', json=_quote_payload(), headers=headers).get_json()['data']
+        # Pas de header Authorization → la vue publique reste accessible.
+        r = client.get(f'/p/{q["share_token"]}')
+        assert r.status_code == 200
+        data = r.get_json()['data']
+        assert data['number'] == q['number']
+        assert 'company' in data
+
+    def test_public_view_returns_document_json_snapshot(self, client):
+        headers = _setup_user_with_company(client)
+        snapshot = {
+            'sections': [{'title': 'Matériel', 'lines': [{'designation': 'Planche', 'qty': 2, 'pu': 1000}]}],
+            'rubriques': [{'label': 'Usinage', 'lines': [{'mode': 'forfait', 'amount': 5000}]}],
+            'grandTotal': 7000,
+        }
+        q = client.post('/api/quotes', json=_quote_payload(document_json=snapshot),
+                        headers=headers).get_json()['data']
+        assert q['document_json'] == snapshot
+        r = client.get(f'/p/{q["share_token"]}')
+        assert r.get_json()['data']['document_json'] == snapshot
+
+    def test_unknown_token_returns_404(self, client):
+        import uuid
+        assert client.get(f'/p/{uuid.uuid4()}').status_code == 404
+
+    def test_enable_share_returns_public_url(self, client):
+        headers = _setup_user_with_company(client)
+        q = client.post('/api/quotes', json=_quote_payload(), headers=headers).get_json()['data']
+        r = client.post(f'/api/quotes/{q["id"]}/share', headers=headers)
+        assert r.status_code == 200
+        data = r.get_json()['data']
+        assert data['share_enabled'] is True
+        assert f'/p/{q["share_token"]}' in data['public_url']
+
+    def test_revoke_makes_public_view_404(self, client):
+        headers = _setup_user_with_company(client)
+        q = client.post('/api/quotes', json=_quote_payload(), headers=headers).get_json()['data']
+        token = q['share_token']
+        assert client.get(f'/p/{token}').status_code == 200
+        r = client.delete(f'/api/quotes/{q["id"]}/share', headers=headers)
+        assert r.status_code == 200
+        assert r.get_json()['data']['share_enabled'] is False
+        assert client.get(f'/p/{token}').status_code == 404
+
+    def test_regenerate_invalidates_old_link(self, client):
+        headers = _setup_user_with_company(client)
+        q = client.post('/api/quotes', json=_quote_payload(), headers=headers).get_json()['data']
+        old = q['share_token']
+        new = client.post(f'/api/quotes/{q["id"]}/share/regenerate',
+                          headers=headers).get_json()['data']['share_token']
+        assert new != old
+        assert client.get(f'/p/{old}').status_code == 404
+        assert client.get(f'/p/{new}').status_code == 200
+
+
+class TestSyncIdempotency:
+    def test_create_honours_client_id_and_number(self, client):
+        import uuid
+        headers = _setup_user_with_company(client)
+        qid = str(uuid.uuid4())
+        r = client.post('/api/quotes', json=_quote_payload(id=qid, number='DEV-2026-042'),
+                        headers=headers)
+        assert r.status_code == 201
+        data = r.get_json()['data']
+        assert data['id'] == qid
+        assert data['number'] == 'DEV-2026-042'
+
+    def test_replayed_create_is_idempotent(self, client):
+        import uuid
+        headers = _setup_user_with_company(client)
+        qid = str(uuid.uuid4())
+        payload = _quote_payload(id=qid)
+        r1 = client.post('/api/quotes', json=payload, headers=headers)
+        r2 = client.post('/api/quotes', json=payload, headers=headers)
+        assert r1.status_code == 201
+        assert r2.status_code == 200  # rejeu de la file de sync → pas de doublon
+        assert r2.get_json()['data']['id'] == qid
+        lst = client.get('/api/quotes', headers=headers).get_json()['data']
+        assert len([x for x in lst if x['id'] == qid]) == 1
+
+    def test_delete_is_idempotent(self, client):
+        headers = _setup_user_with_company(client)
+        q = client.post('/api/quotes', json=_quote_payload(), headers=headers).get_json()['data']
+        assert client.delete(f'/api/quotes/{q["id"]}', headers=headers).status_code == 204
+        assert client.delete(f'/api/quotes/{q["id"]}', headers=headers).status_code == 204
+
+
 class TestTotals:
     def test_tax_computed_correctly(self, client):
         headers = _setup_user_with_company(client)

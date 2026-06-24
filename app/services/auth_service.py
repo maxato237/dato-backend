@@ -34,24 +34,30 @@ class AuthService:
         if email and User.query.filter_by(email=email).first():
             raise ConflictError('Cet e-mail est déjà utilisé.')
 
+        require_otp = current_app.config.get('REQUIRE_OTP', False)
         user = User(
             phone=phone,
             email=email,
             name=name,
             password_hash=AuthService._hash_password(password),
-            is_verified=False,
+            is_verified=not require_otp,  # vérifié direct si OTP non requis
         )
         db.session.add(user)
         db.session.flush()
 
-        otp = AuthService._create_otp(user, 'registration')
-        db.session.commit()
+        if require_otp:
+            otp = AuthService._create_otp(user, 'registration')
+            db.session.commit()
+            current_app.logger.info(f'[OTP registration] {phone} → {otp}')
+            print(f'\n{"─"*45}')
+            print(f'  📱 OTP INSCRIPTION  {phone}')
+            print(f'  🔑 Code : {otp}')
+            print(f'{"─"*45}\n')
+        else:
+            otp = None
+            db.session.commit()
+            current_app.logger.info(f'[AUTH] Inscription sans OTP : {phone} — compte vérifié automatiquement')
 
-        current_app.logger.info(f'[OTP registration] {phone} → {otp}')
-        print(f'\n{"─"*45}')
-        print(f'  📱 OTP INSCRIPTION  {phone}')
-        print(f'  🔑 Code : {otp}')
-        print(f'{"─"*45}\n')
         return user, otp
 
     @staticmethod

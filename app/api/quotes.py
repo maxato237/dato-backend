@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from flask import Blueprint, request, g, send_file
+from flask import Blueprint, request, g, send_file, current_app
 import io
 
 from app.extensions import db
@@ -28,6 +28,12 @@ def _quote_or_404(company, quote_id):
     if not quote:
         raise NotFoundError('Devis')
     return quote
+
+
+def _public_url(share_token) -> str:
+    """URL publique joignable (ex. http://192.168.1.128:5000/p/<token>),
+    construite depuis l'hôte de la requête pour rester valable sur le réseau local."""
+    return f"{request.host_url.rstrip('/')}/p/{share_token}"
 
 
 def _next_quote_number(company) -> str:
@@ -107,15 +113,25 @@ def create_quote():
     company = _company_or_404(g.current_user)
     data = QuoteCreateSchema().load(request.get_json(silent=True) or {})
 
+    provided_id = data.get('id')
+    if provided_id:
+        existing = Quote.query.filter_by(id=provided_id, company_id=company.id).first()
+        if existing:
+            # Rejeu de la file de sync : la création a déjà été appliquée → idempotent.
+            return success(data=existing.to_dict())
+
     quote = Quote(
         company_id=company.id,
         client_id=data.get('client_id'),
-        number=_next_quote_number(company),
+        number=data.get('number') or _next_quote_number(company),
         title=data['title'],
         validity_days=data.get('validity_days', 30),
         notes=data.get('notes'),
         tax_rate=data.get('tax_rate', 0),
+        document_json=data.get('document_json'),
     )
+    if provided_id:
+        quote.id = provided_id
     db.session.add(quote)
     db.session.flush()
 
@@ -153,6 +169,8 @@ def update_quote(quote_id):
         quote.notes = data['notes']
     if 'tax_rate' in data:
         quote.tax_rate = data['tax_rate']
+    if 'document_json' in data:
+        quote.document_json = data['document_json']
     if 'items' in data:
         _apply_items(quote, data['items'])
 
@@ -221,10 +239,54 @@ def duplicate_quote(quote_id):
 @login_required
 def delete_quote(quote_id):
     company = _company_or_404(g.current_user)
-    quote = _quote_or_404(company, quote_id)
-    db.session.delete(quote)
-    db.session.commit()
+    # Idempotent : un rejeu de suppression sur un devis déjà absent reste un 204.
+    quote = Quote.query.filter_by(id=quote_id, company_id=company.id).first()
+    if quote:
+        db.session.delete(quote)
+        db.session.commit()
     return no_content()
+
+
+@quotes_bp.post('/<uuid:quote_id>/share')
+@login_required
+def enable_share(quote_id):
+    """Active (ou réactive) le lien public et le renvoie. Pas de rotation du jeton."""
+    company = _company_or_404(g.current_user)
+    quote = _quote_or_404(company, quote_id)
+    quote.share_enabled = True
+    db.session.commit()
+    return success(data={
+        'share_token': str(quote.share_token),
+        'share_enabled': True,
+        'public_url': _public_url(quote.share_token),
+    })
+
+
+@quotes_bp.post('/<uuid:quote_id>/share/regenerate')
+@login_required
+def regenerate_share(quote_id):
+    """Génère un NOUVEAU jeton : l'ancien lien devient définitivement invalide."""
+    company = _company_or_404(g.current_user)
+    quote = _quote_or_404(company, quote_id)
+    quote.share_token = uuid.uuid4()
+    quote.share_enabled = True
+    db.session.commit()
+    return success(data={
+        'share_token': str(quote.share_token),
+        'share_enabled': True,
+        'public_url': _public_url(quote.share_token),
+    })
+
+
+@quotes_bp.delete('/<uuid:quote_id>/share')
+@login_required
+def revoke_share(quote_id):
+    """Révoque le lien public : la vue publique renverra 404 (jeton conservé)."""
+    company = _company_or_404(g.current_user)
+    quote = _quote_or_404(company, quote_id)
+    quote.share_enabled = False
+    db.session.commit()
+    return success(data={'share_token': str(quote.share_token), 'share_enabled': False})
 
 
 @quotes_bp.get('/<uuid:quote_id>/pdf')
@@ -239,4 +301,56 @@ def download_pdf(quote_id):
         mimetype='application/pdf',
         as_attachment=True,
         download_name=filename,
+    )
+
+
+@quotes_bp.post('/pdf')
+@login_required
+def render_template_pdf():
+    """Génère un PDF à partir du modèle Word de l'entreprise, sans persistance.
+
+    Les devis vivent en mémoire côté app (offline-first) ; cet endpoint reçoit
+    donc les lignes du tableau déjà formatées et les injecte dans le template
+    Word (en-tête / pied de page préservés), puis renvoie le PDF.
+
+    Corps JSON attendu :
+        {
+          "number": "DEV-001",
+          "rows": [
+            {"kind": "line", "designation": "...", "qty": "2",
+             "pu": "1 000", "pt": "2 000"},
+            {"kind": "span", "label": "TOTAL GÉNÉRAL", "amount": "...",
+             "bold": true}
+          ]
+        }
+
+    Renvoie 422 si aucun modèle n'est configuré ou si la génération échoue
+    (l'app retombe alors sur son rendu local par défaut).
+    """
+    company = _company_or_404(g.current_user)
+    if not getattr(company, 'template_docx_url', None):
+        raise ApiError('Aucun modèle Word configuré pour cette entreprise.', 422)
+
+    payload = request.get_json(silent=True) or {}
+    number = str(payload.get('number') or 'devis')
+
+    from app.services.pdf_service import _load_file_bytes
+    from app.services.docx_template_service import render_quote_docx, docx_to_pdf
+
+    template_bytes = _load_file_bytes(company.template_docx_url)
+    if not template_bytes:
+        raise ApiError('Modèle Word introuvable ou inaccessible.', 422)
+
+    try:
+        filled = render_quote_docx(template_bytes, payload)
+        pdf_bytes = docx_to_pdf(filled)
+    except Exception as exc:  # noqa: BLE001
+        current_app.logger.warning('Rendu PDF via template échoué : %s', exc)
+        raise ApiError(f'Échec de la génération via le modèle : {exc}', 422)
+
+    return send_file(
+        io.BytesIO(pdf_bytes),
+        mimetype='application/pdf',
+        as_attachment=True,
+        download_name=f'devis-{number}.pdf',
     )

@@ -24,9 +24,20 @@ def register():
         password=data['password'],
         email=data.get('email'),
     )
-    body = {'message': 'Compte créé. Veuillez vérifier votre code OTP.', 'phone': user.phone}
-    if current_app.config.get('OTP_IN_RESPONSE'):
-        body['dev_otp'] = otp
+    if current_app.config.get('REQUIRE_OTP', False):
+        # OTP requis : l'utilisateur doit vérifier son code avant de se connecter.
+        body = {'message': 'Compte créé. Veuillez vérifier votre code OTP.', 'phone': user.phone}
+        if current_app.config.get('OTP_IN_RESPONSE') and otp:
+            body['dev_otp'] = otp
+    else:
+        # Pas d'OTP : compte immédiatement vérifié, on retourne les tokens.
+        tokens = TokenService.create_token_pair(user)
+        body = {
+            'message': 'Compte créé.',
+            'phone': user.phone,
+            'user': user.to_dict(),
+            **tokens,
+        }
     return created(data=body)
 
 

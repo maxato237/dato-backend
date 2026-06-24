@@ -9,9 +9,8 @@ class CompanySchema(Schema):
     phones = fields.List(fields.Str(), required=False, load_default=[])
     currency = fields.Str(required=False, load_default='FCFA', validate=validate.Length(max=10))
     logo_url = fields.Str(required=False, allow_none=True, load_default=None)
-    header_image_url = fields.Str(required=False, allow_none=True, load_default=None)
-    footer_image_url = fields.Str(required=False, allow_none=True, load_default=None)
     location = fields.Str(required=False, allow_none=True, load_default=None, validate=validate.Length(max=300))
+    template_docx_url = fields.Str(required=False, allow_none=True, load_default=None)
 
 
 class SignatureSchema(Schema):

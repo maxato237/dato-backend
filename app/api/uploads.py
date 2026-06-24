@@ -38,8 +38,10 @@ def upload_image():
         )
 
     # Supabase Storage si configuré, sinon disque local (cf. storage_service).
-    url = save_image(file, ext)
-    filename = url.rsplit('/', 1)[-1]
+    url = save_image(file, ext, folder='logos')
+    # Extraire le chemin relatif depuis /uploads/ (mode local : 'logos/abc.png')
+    # ou juste le dernier segment pour Supabase (usage affichage uniquement).
+    filename = url.split('/uploads/', 1)[1] if '/uploads/' in url else url.rsplit('/', 1)[-1]
     return success(data={'url': url, 'filename': filename})
 
 
