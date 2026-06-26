@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import subprocess
 import tempfile
+import unicodedata
 
 from docx import Document  # type: ignore[import-untyped]
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT  # type: ignore[import-untyped]
@@ -318,9 +320,137 @@ def fill_template_rows(template_bytes: bytes, rows: list[dict]) -> bytes:
     return output.getvalue()
 
 
+# ---------------------------------------------------------------------------
+# Lignes-gabarits : reprise du design du tableau du modèle (approche A)
+# ---------------------------------------------------------------------------
+#
+# Le modèle Word peut contenir, sous l'en-tête du tableau, des « lignes-
+# gabarits » dont la 1re cellule commence par un marqueur. Le backend lit leur
+# mise en forme (fond + police), supprime ces lignes, puis applique ce style
+# aux lignes générées du même type. Si un marqueur est absent, le rendu reste
+# neutre (aucun design n'est imposé) :
+#
+#   @ligne          → style des lignes d'articles
+#   @total          → style des sous-totaux (sections, rubriques)
+#   @total-general  → style du total général (mis en avant)
+#
+# Marqueurs insensibles à la casse et aux accents (« @TOTAL GÉNÉRAL » convient).
+
+_MARKER_KIND = {
+    'ligne': 'line',
+    'line': 'line',
+    'total': 'span',
+    'soustotal': 'span',
+    'totalgeneral': 'strong',
+}
+
+
+class _RowStyle:
+    """Mise en forme capturée d'une ligne-gabarit du modèle."""
+
+    def __init__(self, fill=None, bold=None, color=None, size=None):
+        self.fill = fill      # fond hex (ex. 'EEF3EE') ou None
+        self.bold = bold      # bool ou None
+        self.color = color    # couleur de police hex ou None
+        self.size = size      # taille en points ou None
+
+
+def _norm_marker(text: str) -> str:
+    """Minuscules, sans accents ni caractères non alphanumériques."""
+    text = unicodedata.normalize('NFKD', text)
+    text = ''.join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r'[^a-z0-9]', '', text.lower())
+
+
+def _marker_kind(cell_text: str):
+    """Type de ligne ('line'/'span'/'strong') si la cellule est un marqueur
+    « @… », sinon None."""
+    t = cell_text.strip()
+    if not t.startswith('@'):
+        return None
+    return _MARKER_KIND.get(_norm_marker(t))
+
+
+def _cell_fill(cell):
+    """Couleur de fond (hex) d'une cellule, ou None."""
+    tcPr = cell._tc.tcPr
+    if tcPr is None:
+        return None
+    shd = tcPr.find(qn('w:shd'))
+    if shd is None:
+        return None
+    fill = shd.get(qn('w:fill'))
+    return fill if fill and fill != 'auto' else None
+
+
+def _first_run_style(cell):
+    """(bold, color_hex|None, size_pt|None) du 1er run de la cellule."""
+    for para in cell.paragraphs:
+        for run in para.runs:
+            color = None
+            try:
+                if run.font.color is not None and run.font.color.rgb is not None:
+                    color = str(run.font.color.rgb)
+            except (AttributeError, ValueError):
+                color = None
+            size = run.font.size.pt if run.font.size is not None else None
+            return bool(run.bold), color, size
+    return None, None, None
+
+
+def _extract_row_style(row) -> _RowStyle:
+    """Capture fond + police d'une ligne-gabarit."""
+    fill = None
+    for cell in row.cells:
+        fill = _cell_fill(cell)
+        if fill:
+            break
+    bold, color, size = (
+        _first_run_style(row.cells[0]) if row.cells else (None, None, None))
+    return _RowStyle(fill=fill, bold=bold, color=color, size=size)
+
+
+def _capture_template_styles(table) -> dict:
+    """Lit les lignes-gabarits (« @… ») du modèle → {kind: _RowStyle}.
+
+    À appeler avant ``_delete_data_rows`` : les gabarits sont des lignes de
+    données et seront supprimés avec les autres."""
+    styles: dict = {}
+    for row in list(table.rows)[1:]:
+        if not row.cells:
+            continue
+        kind = _marker_kind(row.cells[0].text)
+        if kind and kind not in styles:
+            styles[kind] = _extract_row_style(row)
+    return styles
+
+
+def _apply_row_style(row, style) -> None:
+    """Applique le fond + la police d'une ligne-gabarit à une ligne générée."""
+    if style is None:
+        return
+    for cell in row.cells:
+        if style.fill:
+            _shade_cell(cell, style.fill)
+        for para in cell.paragraphs:
+            for run in para.runs:
+                if style.bold is not None:
+                    run.bold = style.bold
+                if style.color:
+                    run.font.color.rgb = RGBColor.from_string(style.color)
+                if style.size:
+                    run.font.size = Pt(style.size)
+
+
 def _fill_existing_table(table, rows: list[dict]) -> None:
-    """Remplace les lignes de données d'un tableau existant par `rows`."""
+    """Remplace les lignes de données d'un tableau existant par `rows`.
+
+    Si le modèle fournit des lignes-gabarits (« @ligne », « @total »,
+    « @total-general »), leur mise en forme (fond + police) est reprise pour
+    les lignes générées correspondantes ; sinon le rendu reste neutre.
+    """
     num_cols = len(table.columns)
+    styles = _capture_template_styles(table)
     _delete_data_rows(table)
     # En-tête conservée : répétée sur chaque page + non sécable.
     if table.rows:
@@ -329,9 +459,18 @@ def _fill_existing_table(table, rows: list[dict]) -> None:
     for row in rows:
         kind = str(row.get('kind', 'line'))
         bold = bool(row.get('bold', False))
+        strong = bool(row.get('strong', False))
         cells = _map_row_cells(kind, row, num_cols)
         new_row = _add_row(table, cells, bold=bold)
         _row_cant_split(new_row)
+        # Style gabarit selon le type : total général > sous-total > ligne.
+        if strong:
+            style = styles.get('strong') or styles.get('span')
+        elif kind == 'span':
+            style = styles.get('span')
+        else:
+            style = styles.get('line')
+        _apply_row_style(new_row, style)
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +581,7 @@ def _build_quote_body(doc, data: dict) -> None:
     # Bloc de conclusion (Arrêté… + NB + signatures) soudé : il bascule en
     # entier sur la page suivante plutôt que de laisser les signatures seules.
     # « Arrêté le présent devis à la somme de … ».
-    words = str(data.get('amountInWords', '')).strip()
+    words = str(data.get('amountInWords', '')).strip().upper()
     if words:
         p = doc.add_paragraph()
         p.paragraph_format.space_before = Pt(16)

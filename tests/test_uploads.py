@@ -94,9 +94,10 @@ class TestSupabaseStorage:
         # L'URL d'upload (privée) cible le bon bucket.
         assert '/storage/v1/object/DATO_PROFIL_PDP_PDC/' in captured['url']
 
-    def test_upload_supabase_failure_raises(self, app, monkeypatch):
+    def test_upload_supabase_failure_falls_back_local(self, app, monkeypatch):
+        """Si Supabase renvoie une erreur, on ne lève PLUS d'erreur : on bascule
+        automatiquement sur le disque local (l'utilisateur n'est jamais bloqué)."""
         import app.services.storage_service as ss
-        from app.utils.errors import ApiError
 
         monkeypatch.setitem(app.config, 'SUPABASE_URL', 'https://proj.supabase.co')
         monkeypatch.setitem(app.config, 'SUPABASE_SERVICE_ROLE_KEY', 'svc-key')
@@ -113,12 +114,32 @@ class TestSupabaseStorage:
             def read(self):
                 return b'x'
 
-        with app.app_context():
-            try:
-                ss.save_image(_FakeFile(), 'png')
-                assert False, 'aurait dû lever ApiError'
-            except ApiError as e:
-                assert e.status_code == 502
+        with app.test_request_context('http://testhost/'):
+            url = ss.save_image(_FakeFile(), 'png')
+        assert '/uploads/' in url
+        assert url.endswith('.png')
+
+    def test_upload_supabase_network_error_falls_back_local(self, app, monkeypatch):
+        """Coupure réseau / DNS (getaddrinfo failed) → repli local, sans erreur."""
+        import app.services.storage_service as ss
+
+        monkeypatch.setitem(app.config, 'SUPABASE_URL', 'https://proj.supabase.co')
+        monkeypatch.setitem(app.config, 'SUPABASE_SERVICE_ROLE_KEY', 'svc-key')
+
+        def _boom(*a, **k):
+            raise ss.requests.exceptions.ConnectionError('getaddrinfo failed')
+
+        monkeypatch.setattr(ss.requests, 'post', _boom)
+
+        class _FakeFile:
+            mimetype = 'image/png'
+
+            def read(self):
+                return b'x'
+
+        with app.test_request_context('http://testhost/'):
+            url = ss.save_image(_FakeFile(), 'png')
+        assert '/uploads/' in url
 
 
 class TestCompanyImageFields:
