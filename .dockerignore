@@ -1,0 +1,25 @@
+# Environnements & caches Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets & variables d'env (jamais dans l'image)
+.env
+.env.*
+!.env.example
+
+# Données locales / volatiles
+uploads/
+*.sqlite3
+instance/
+
+# Outils & VCS
+.git/
+.gitignore
+tests/
+Dockerfile
+.dockerignore

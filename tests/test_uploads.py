@@ -146,22 +146,22 @@ class TestCompanyImageFields:
     def test_company_accepts_image_fields(self, client):
         headers = _auth_headers(client)
         payload = {
-            'name': 'MILLENAIRE DECOR',
+            'name': 'ATELIER DÉMO',
             'activity': 'Menuiserie',
-            'address': 'BP 705 YDE',
+            'address': 'BP 0000',
             'city': 'Yaoundé',
-            'phones': ['674702037'],
+            'phones': ['600000000'],
             'currency': 'FCFA',
             'logo_url': 'http://x/uploads/logo.png',
-            'location': 'Situé à NKOLFOULOU (carrefour ENIET de SOA)',
+            'location': 'Situé au quartier Démo (point de repère)',
             'template_docx_url': 'http://x/uploads/template.docx',
         }
         r = client.post('/api/company', json=payload, headers=headers)
         assert r.status_code == 201
         data = r.get_json()['data']
-        assert data['address'] == 'BP 705 YDE'
+        assert data['address'] == 'BP 0000'
         assert data['logo_url'] == 'http://x/uploads/logo.png'
-        assert data['location'].startswith('Situé à NKOLFOULOU')
+        assert data['location'].startswith('Situé au quartier Démo')
         assert data['template_docx_url'] == 'http://x/uploads/template.docx'
 
     def test_company_update_image_fields(self, client):

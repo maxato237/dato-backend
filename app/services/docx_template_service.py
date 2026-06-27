@@ -5,8 +5,8 @@ Deux familles de templates sont gérées (cf. ``render_quote_docx``) :
 A. Template avec **tableau** dont la 1re ligne contient « Désignation » :
    on conserve l'en-tête du tableau et on remplace ses lignes de données.
 
-B. Template **papèterie** (en-tête/pied de page Word seuls, corps vide,
-   ex. « MILLENAIRE DECOR ») : on **construit tout le corps** du devis
+B. Template **papèterie** (en-tête/pied de page Word seuls, corps vide) :
+   on **construit tout le corps** du devis
    (titre, client, tableau, total en lettres, signatures) dans le corps,
    pendant que Word conserve l'en-tête et le pied de page sur chaque page.
 
@@ -29,7 +29,8 @@ from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT  # type: ignore[import-un
 from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore[import-untyped]
 from docx.oxml import OxmlElement  # type: ignore[import-untyped]
 from docx.oxml.ns import qn  # type: ignore[import-untyped]
-from docx.shared import Pt, RGBColor  # type: ignore[import-untyped]
+from docx.shared import Cm, Emu, Pt, RGBColor  # type: ignore[import-untyped]
+from docx.text.paragraph import Paragraph  # type: ignore[import-untyped]
 
 from app.models.quote import Quote
 
@@ -492,15 +493,17 @@ def _apply_row_style(row, style) -> None:
 
 
 def _fill_existing_table(table, rows: list[dict]) -> None:
-    """Remplace les lignes de données d'un tableau existant par `rows`.
+    """Remplace les lignes de données du tableau du modèle par `rows`.
 
-    Si le modèle fournit des lignes-gabarits (« @ligne », « @total »,
-    « @total-general »), leur mise en forme (fond + police) est reprise pour
-    les lignes générées correspondantes ; sinon le rendu reste neutre.
-    """
+    Le modèle ne donne que le **style** du tableau (fonds des bandes, police,
+    en-tête) ; le **contenu** vient de l'app. On reprend donc le design (via
+    lignes-gabarits « @… » ou détection auto), on garantit une grille de
+    bordures, et on aligne les cellules (qté centrée, montants à droite,
+    centrage vertical)."""
     num_cols = len(table.columns)
     styles = _capture_template_styles(table)
     _delete_data_rows(table)
+    _ensure_grid_borders(table)
     # En-tête conservée : répétée sur chaque page + non sécable.
     if table.rows:
         _row_cant_split(table.rows[0])
@@ -517,10 +520,45 @@ def _fill_existing_table(table, rows: list[dict]) -> None:
                 str(row.get('amount', '')), bold=bold)
         else:
             style = styles.get('line')
-            cells = _map_row_cells(kind, row, num_cols)
-            new_row = _add_row(table, cells, bold=bold)
+            new_row = _add_line_row(table, num_cols, row)
         _row_cant_split(new_row)
         _apply_row_style(new_row, style)
+
+
+def _ensure_grid_borders(table) -> None:
+    """Force une grille de bordures fines (toutes les lignes encadrées)."""
+    tblPr = table._tbl.tblPr
+    existing = tblPr.find(qn('w:tblBorders'))
+    if existing is not None:
+        tblPr.remove(existing)
+    _add_table_borders(table, color='BFBFBF', sz='4')
+
+
+def _add_line_row(table, num_cols: int, row: dict):
+    """Ajoute une ligne d'article : seule la désignation (texte) reste à
+    gauche ; tous les nombres (Qté, P.U, P.T) sont alignés à droite."""
+    new_row = table.add_row()
+    cells = new_row.cells
+    desig = str(row.get('designation', ''))
+    qty = str(row.get('qty', ''))
+    pu = str(row.get('pu', ''))
+    pt = str(row.get('pt', ''))
+    R = WD_ALIGN_PARAGRAPH.RIGHT
+    if num_cols >= 4:
+        _set_cell_text(cells[0], desig)
+        _set_cell_text(cells[1], qty, align=R)
+        _set_cell_text(cells[2], pu, align=R)
+        _set_cell_text(cells[3], pt, align=R)
+    elif num_cols == 3:
+        _set_cell_text(cells[0], desig)
+        _set_cell_text(cells[1], qty, align=R)
+        _set_cell_text(cells[2], pt, align=R)
+    elif num_cols == 2:
+        _set_cell_text(cells[0], desig)
+        _set_cell_text(cells[1], pt, align=R)
+    else:
+        _set_cell_text(cells[0], desig)
+    return new_row
 
 
 def _add_span_row(table, num_cols: int, label: str, amount: str,
@@ -760,12 +798,135 @@ def _replace_placeholders(doc, data: dict) -> None:
         _replace_in_paragraph(para, resolve)
 
 
+# ---------------------------------------------------------------------------
+# Injection du contenu de l'app dans le corps du modèle (sans placeholders)
+# ---------------------------------------------------------------------------
+#
+# Principe : le modèle ne donne QUE le style. Le corps du modèle est un exemple
+# de devis ; on remplace son texte par celui du devis de l'app **en place**
+# (donc en gardant la mise en forme de chaque paragraphe), en reconnaissant
+# chaque ligne par son motif :
+#   - « DOIT … »                  → DOIT : {client}
+#   - « Arrêté … »                → Arrêté … à la somme de {montant_en_lettres}.
+#   - « …, le 22 Juin 2026 »      → {cityDate} (ville + date du devis)
+#   - titre (centré + gras, « DEVIS ») → {title}
+# La note (NB) est insérée après la ligne « Arrêté… » si elle est renseignée.
+
+_DATE_RE = re.compile(r'\ble\s+\d{1,2}\s+\w+\s+\d{4}', re.IGNORECASE)
+
+
+def _has_placeholders(doc) -> bool:
+    return any('{{' in p.text for p in doc.paragraphs)
+
+
+def _set_para_text(paragraph, text: str) -> None:
+    """Réduit le paragraphe à son 1er run (format conservé) avec `text`."""
+    if not paragraph.runs:
+        paragraph.add_run(text)
+        return
+    paragraph.runs[0].text = text
+    for r in paragraph.runs[1:]:
+        r.text = ''
+
+
+def _looks_like_title(paragraph) -> bool:
+    txt = paragraph.text.strip()
+    if len(txt) < 15 or 'DEVIS' not in txt.upper():
+        return False
+    centered = paragraph.alignment == WD_ALIGN_PARAGRAPH.CENTER
+    bold = any(r.bold for r in paragraph.runs)
+    return centered and bold
+
+
+def _apply_body_content(doc, data: dict) -> None:
+    """Injecte le contenu du devis dans le corps du modèle, en place."""
+    title = str(data.get('title', '')).strip()
+    client = str(data.get('client', '')).strip()
+    city_date = str(data.get('cityDate', '')).strip()
+    words = str(data.get('amountInWords', '')).strip().upper()
+    note = str(data.get('note', '')).strip()
+
+    arrete_para = None
+    done = set()
+    strays = []
+    for p in doc.paragraphs:
+        t = p.text.strip()
+        if not t:
+            continue
+        norm = t.replace('\xa0', ' ')
+        if 'doit' not in done and norm.upper().startswith('DOIT'):
+            # Garde « DOIT : » du modèle, ajoute le client en gras.
+            _set_para_text(p, 'DOIT : ')
+            run = p.add_run(client)
+            run.bold = True
+            done.add('doit')
+        elif 'arrete' not in done and norm.lower().startswith('arrêté'):
+            runs = p.runs
+            runs[0].text = 'Arrêté le présent devis à la somme de '
+            if len(runs) > 1:
+                runs[1].text = words + '.'
+                for r in runs[2:]:
+                    r.text = ''
+            else:
+                extra = p.add_run(words + '.')
+                extra.bold = True
+                extra.italic = True
+            arrete_para = p
+            done.add('arrete')
+        elif 'date' not in done and city_date and _DATE_RE.search(norm):
+            _set_para_text(p, city_date)
+            done.add('date')
+        elif 'title' not in done and _looks_like_title(p):
+            _set_para_text(p, title)
+            done.add('title')
+        elif (p.alignment == WD_ALIGN_PARAGRAPH.CENTER
+              and 'DEVIS' in norm.upper()
+              and not any(r.bold for r in p.runs)):
+            # Fragment de titre résiduel du modèle (non gras) : contenu parasite.
+            strays.append(p)
+
+    for p in strays:
+        p._p.getparent().remove(p._p)
+
+    # NB inséré après la ligne « Arrêté… » (uniquement si renseigné).
+    if note and arrete_para is not None:
+        new_p = OxmlElement('w:p')
+        arrete_para._p.addnext(new_p)
+        np = Paragraph(new_p, arrete_para._parent)
+        run = np.add_run(f'NB : {note}')
+        run.bold = False
+
+
+def _ensure_header_clearance(doc, gap_cm: float = 0.6) -> None:
+    """Évite que le corps (et l'en-tête de tableau répété sur les pages
+    suivantes) ne se colle au bandeau d'en-tête Word.
+
+    Si la marge haute est plus petite que la hauteur du bandeau d'en-tête,
+    on l'augmente à « hauteur du bandeau + marge » pour ménager un interligne.
+    On n'augmente jamais à la baisse (un modèle déjà bien réglé est préservé)."""
+    wp = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
+    for section in doc.sections:
+        heights = [
+            int(e.get('cy'))
+            for e in section.header._element.iter(f'{{{wp}}}extent')
+            if e.get('cy')
+        ]
+        if not heights:
+            continue
+        needed = max(heights) + Cm(gap_cm)
+        if section.top_margin is None or section.top_margin < needed:
+            section.top_margin = Emu(int(needed))
+
+
 def render_quote_docx(template_bytes: bytes, data: dict) -> bytes:
     """Produit le .docx final du devis à partir du template et des données app.
 
-    - Si le template contient un tableau « Désignation » → on le remplit et on
-      remplace les placeholders « {{…}} » (titre, client, montant en lettres…).
-    - Sinon (papèterie : en-tête/pied seuls) → on construit tout le corps.
+    - Modèle **avec tableau** : le modèle ne fournit que le style. On reprend le
+      design du tableau, on le remplit avec les lignes de l'app, et on injecte
+      le contenu (titre, date, client, montant en lettres, NB) dans le corps —
+      par placeholders « {{…}} » si le modèle en contient, sinon par
+      reconnaissance des lignes du corps.
+    - Modèle **papèterie** (sans tableau) : on construit tout le corps.
 
     `data` : {'rows', 'cityDate', 'title', 'client', 'amountInWords',
               'note', 'signatures', 'number'}.
@@ -775,9 +936,16 @@ def render_quote_docx(template_bytes: bytes, data: dict) -> bytes:
     table = _find_items_table(doc)
     if table is not None:
         _fill_existing_table(table, data.get('rows', []))
-        _replace_placeholders(doc, data)
+        if _has_placeholders(doc):
+            _replace_placeholders(doc, data)
+        else:
+            _apply_body_content(doc, data)
     else:
         _build_quote_body(doc, data)
+
+    # Marge haute suffisante pour ne pas coller le contenu au bandeau d'en-tête
+    # (visible surtout sur les pages 2+ où l'en-tête de tableau est répété).
+    _ensure_header_clearance(doc)
 
     output = io.BytesIO()
     doc.save(output)
