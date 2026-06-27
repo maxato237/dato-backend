@@ -321,20 +321,27 @@ def fill_template_rows(template_bytes: bytes, rows: list[dict]) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Lignes-gabarits : reprise du design du tableau du modèle (approche A)
+# Reprise du design du tableau du modèle (approche A)
 # ---------------------------------------------------------------------------
 #
-# Le modèle Word peut contenir, sous l'en-tête du tableau, des « lignes-
-# gabarits » dont la 1re cellule commence par un marqueur. Le backend lit leur
-# mise en forme (fond + police), supprime ces lignes, puis applique ce style
-# aux lignes générées du même type. Si un marqueur est absent, le rendu reste
-# neutre (aucun design n'est imposé) :
+# But : conserver la mise en forme du tableau dessinée dans le modèle Word
+# (fonds des bandes de sous-totaux, fond du total général, police), au lieu de
+# ré-injecter des lignes neutres.
 #
-#   @ligne          → style des lignes d'articles
-#   @total          → style des sous-totaux (sections, rubriques)
-#   @total-general  → style du total général (mis en avant)
+# Deux sources de style, par ordre de priorité :
 #
-# Marqueurs insensibles à la casse et aux accents (« @TOTAL GÉNÉRAL » convient).
+# 1. Marqueurs explicites — une ligne-gabarit dont la 1re cellule commence par
+#    un marqueur, mise en forme comme voulu :
+#       @ligne          → style des lignes d'articles
+#       @total          → style des sous-totaux (sections, rubriques)
+#       @total-general  → style du total général (mis en avant)
+#    Marqueurs insensibles à la casse et aux accents (« @TOTAL GÉNÉRAL » OK).
+#
+# 2. Détection automatique (si aucun marqueur) — on lit les lignes déjà
+#    stylées du modèle : les lignes teintées deviennent le style des bandes
+#    (sous-total / total général selon le libellé), la 1re ligne non teintée
+#    le style des lignes d'articles. Permet de respecter un modèle déjà conçu
+#    sans rien y ajouter. Si le modèle n'a aucune ligne stylée, rendu neutre.
 
 _MARKER_KIND = {
     'ligne': 'line',
@@ -411,10 +418,11 @@ def _extract_row_style(row) -> _RowStyle:
 
 
 def _capture_template_styles(table) -> dict:
-    """Lit les lignes-gabarits (« @… ») du modèle → {kind: _RowStyle}.
+    """Styles à reprendre du modèle → {kind: _RowStyle}, kind ∈ line/span/strong.
 
-    À appeler avant ``_delete_data_rows`` : les gabarits sont des lignes de
-    données et seront supprimés avec les autres."""
+    Priorité aux marqueurs explicites (« @… ») ; à défaut, détection auto des
+    lignes déjà stylées. À appeler avant ``_delete_data_rows`` (les lignes lues
+    sont supprimées ensuite avec les autres données)."""
     styles: dict = {}
     for row in list(table.rows)[1:]:
         if not row.cells:
@@ -422,14 +430,55 @@ def _capture_template_styles(table) -> dict:
         kind = _marker_kind(row.cells[0].text)
         if kind and kind not in styles:
             styles[kind] = _extract_row_style(row)
+    if styles:
+        return styles
+    return _infer_template_styles(table)
+
+
+def _infer_template_styles(table) -> dict:
+    """Déduit les styles du modèle depuis ses lignes déjà mises en forme.
+
+    - ligne teintée dont le libellé contient « général » → total général ;
+    - autre ligne teintée → bande de sous-total ;
+    - 1re ligne non teintée avec du texte → ligne d'article.
+    Repli : si aucune ligne « général », la dernière ligne teintée fait office
+    de total général (souvent le cas dans les modèles)."""
+    styles: dict = {}
+    last_shaded = None
+    for row in list(table.rows)[1:]:
+        if not row.cells:
+            continue
+        fill = None
+        for cell in row.cells:
+            fill = _cell_fill(cell)
+            if fill:
+                break
+        if fill:
+            last_shaded = row
+            label = _norm_marker(row.cells[0].text)
+            if 'general' in label:
+                styles.setdefault('strong', _extract_row_style(row))
+            else:
+                styles.setdefault('span', _extract_row_style(row))
+        elif row.cells[0].text.strip():
+            styles.setdefault('line', _extract_row_style(row))
+    if 'strong' not in styles and last_shaded is not None:
+        styles['strong'] = _extract_row_style(last_shaded)
     return styles
 
 
 def _apply_row_style(row, style) -> None:
-    """Applique le fond + la police d'une ligne-gabarit à une ligne générée."""
+    """Applique le fond + la police d'un style capturé à une ligne générée."""
     if style is None:
         return
+    seen = set()
     for cell in row.cells:
+        # Après une fusion, ``row.cells`` répète la cellule fusionnée : on ne la
+        # traite qu'une fois (sinon w:shd dupliqué).
+        tc = cell._tc
+        if tc in seen:
+            continue
+        seen.add(tc)
         if style.fill:
             _shade_cell(cell, style.fill)
         for para in cell.paragraphs:
@@ -460,17 +509,34 @@ def _fill_existing_table(table, rows: list[dict]) -> None:
         kind = str(row.get('kind', 'line'))
         bold = bool(row.get('bold', False))
         strong = bool(row.get('strong', False))
-        cells = _map_row_cells(kind, row, num_cols)
-        new_row = _add_row(table, cells, bold=bold)
-        _row_cant_split(new_row)
-        # Style gabarit selon le type : total général > sous-total > ligne.
-        if strong:
-            style = styles.get('strong') or styles.get('span')
-        elif kind == 'span':
-            style = styles.get('span')
+        if kind == 'span' and num_cols >= 2:
+            style = (styles.get('strong') or styles.get('span')) if strong \
+                else styles.get('span')
+            new_row = _add_span_row(
+                table, num_cols, str(row.get('label', '')),
+                str(row.get('amount', '')), bold=bold)
         else:
             style = styles.get('line')
+            cells = _map_row_cells(kind, row, num_cols)
+            new_row = _add_row(table, cells, bold=bold)
+        _row_cant_split(new_row)
         _apply_row_style(new_row, style)
+
+
+def _add_span_row(table, num_cols: int, label: str, amount: str,
+                  bold: bool = False):
+    """Ajoute une bande (sous-total / total) : libellé fusionné + montant à
+    droite, comme les lignes de total dessinées dans le modèle."""
+    new_row = table.add_row()
+    cells = new_row.cells
+    label_cell = cells[0]
+    for i in range(1, num_cols - 1):
+        label_cell = label_cell.merge(cells[i])
+    _set_cell_text(label_cell, label, bold=bold,
+                   align=WD_ALIGN_PARAGRAPH.CENTER)
+    _set_cell_text(new_row.cells[-1], amount, bold=bold,
+                   align=WD_ALIGN_PARAGRAPH.RIGHT)
+    return new_row
 
 
 # ---------------------------------------------------------------------------
@@ -623,10 +689,82 @@ def _build_quote_body(doc, data: dict) -> None:
             sp.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
 
+# ---------------------------------------------------------------------------
+# Remplacement des placeholders du modèle (mode « modèle avec tableau »)
+# ---------------------------------------------------------------------------
+#
+# Un modèle « avec tableau » ne voit que son tableau rempli : le titre, le
+# client et le montant en lettres restent le texte statique du modèle. Pour les
+# rendre dynamiques sans imposer de mise en page, on remplace des placeholders
+# « {{…}} » par les valeurs réelles du devis, où qu'ils soient dans le corps
+# (paragraphes, cellules, en-tête/pied de page Word) :
+#
+#   {{titre}} {{client}} {{montant_en_lettres}} {{date}} {{numero}} {{note}}
+#
+# Insensibles à la casse/accents/underscores. Placeholder inconnu : laissé tel
+# quel (on ne casse rien).
+
+_PLACEHOLDER_KEYS = {
+    'titre': 'title', 'title': 'title', 'objet': 'title',
+    'client': 'client', 'doit': 'client',
+    'montantenlettres': 'amountInWords', 'lettres': 'amountInWords',
+    'date': 'cityDate', 'villedate': 'cityDate',
+    'numero': 'number', 'number': 'number',
+    'note': 'note', 'nb': 'note',
+}
+
+_PLACEHOLDER_RE = re.compile(r'\{\{([^{}]+)\}\}')
+
+
+def _replace_in_paragraph(paragraph, resolve) -> None:
+    """Remplace les « {{…}} » d'un paragraphe via ``resolve(match)``."""
+    runs = paragraph.runs
+    if not runs:
+        return
+    # 1. Placeholder contenu dans un seul run : remplacement local, le
+    #    formatage du run est préservé.
+    for run in runs:
+        if '{{' in run.text and '}}' in run.text:
+            run.text = _PLACEHOLDER_RE.sub(resolve, run.text)
+    # 2. Placeholder éclaté sur plusieurs runs : on recompose le paragraphe
+    #    dans le 1er run (Word fragmente souvent un mot en plusieurs runs).
+    full = ''.join(r.text for r in runs)
+    if _PLACEHOLDER_RE.search(full):
+        runs[0].text = _PLACEHOLDER_RE.sub(resolve, full)
+        for r in runs[1:]:
+            r.text = ''
+
+
+def _replace_placeholders(doc, data: dict) -> None:
+    """Remplace les placeholders « {{…}} » du corps par les valeurs du devis."""
+    def resolve(match):
+        key = _PLACEHOLDER_KEYS.get(_norm_marker(match.group(1)))
+        if key is None:
+            return match.group(0)  # placeholder inconnu : laissé intact
+        val = '' if data.get(key) is None else str(data.get(key)).strip()
+        # La note porte son étiquette « NB : » uniquement si elle est remplie
+        # (placeholder vide ⇒ pas d'étiquette orpheline).
+        if key == 'note':
+            return f'NB : {val}' if val else ''
+        return val
+
+    paragraphs = list(doc.paragraphs)
+    for table in doc.tables:
+        for trow in table.rows:
+            for cell in trow.cells:
+                paragraphs.extend(cell.paragraphs)
+    for section in doc.sections:
+        paragraphs.extend(section.header.paragraphs)
+        paragraphs.extend(section.footer.paragraphs)
+    for para in paragraphs:
+        _replace_in_paragraph(para, resolve)
+
+
 def render_quote_docx(template_bytes: bytes, data: dict) -> bytes:
     """Produit le .docx final du devis à partir du template et des données app.
 
-    - Si le template contient un tableau « Désignation » → on le remplit.
+    - Si le template contient un tableau « Désignation » → on le remplit et on
+      remplace les placeholders « {{…}} » (titre, client, montant en lettres…).
     - Sinon (papèterie : en-tête/pied seuls) → on construit tout le corps.
 
     `data` : {'rows', 'cityDate', 'title', 'client', 'amountInWords',
@@ -637,6 +775,7 @@ def render_quote_docx(template_bytes: bytes, data: dict) -> bytes:
     table = _find_items_table(doc)
     if table is not None:
         _fill_existing_table(table, data.get('rows', []))
+        _replace_placeholders(doc, data)
     else:
         _build_quote_body(doc, data)
 
