@@ -11,6 +11,13 @@ class BaseConfig:
     JWT_ACCESS_TOKEN_EXPIRES = int(os.getenv('JWT_ACCESS_TOKEN_EXPIRES', 3600))
     JWT_REFRESH_TOKEN_EXPIRES = int(os.getenv('JWT_REFRESH_TOKEN_EXPIRES', 2592000))
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    # Postgres managé (Sevalla/Supabase) ferme les connexions inactives.
+    # pool_pre_ping teste la connexion avant chaque usage et la recrée si
+    # elle est morte ; pool_recycle renouvelle les connexions trop vieilles.
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        'pool_pre_ping': True,
+        'pool_recycle': 280,
+    }
     CORS_ORIGINS = os.getenv('CORS_ORIGINS', '*').split(',')
     OTP_EXPIRES_SECONDS = 600  # 10 minutes
     # Mettre REQUIRE_OTP=1 dans l'env quand Twilio est configuré.
