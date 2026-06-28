@@ -1,4 +1,7 @@
-from flask import Blueprint, request, g
+import io
+
+from flask import Blueprint, request, g, current_app
+from werkzeug.datastructures import FileStorage
 
 from app.extensions import db
 from app.models.company import Company, Signature
@@ -73,8 +76,27 @@ def upload_template():
 
     company = _get_company_or_404(g.current_user)
 
+    # Normalisation best-effort : ré-ancre les images de l'en-tête/pied de page
+    # « à la page » pour un rendu PDF identique Word ↔ LibreOffice. Ne s'exécute
+    # que là où Word est disponible (poste/worker Windows) ; sur l'hébergeur
+    # Linux (sans Word), l'exception est avalée et on stocke le fichier d'origine.
+    raw = file.read()
+    out = raw
+    if ext == 'docx':
+        try:
+            from app.services.template_normalizer import normalize_letterhead
+            out = normalize_letterhead(raw)
+            current_app.logger.info('Modèle %s normalisé (ancrage page).', file.filename)
+        except Exception as exc:  # noqa: BLE001 — best-effort, jamais bloquant
+            current_app.logger.info(
+                'Normalisation du modèle ignorée (%s) : %s', type(exc).__name__, exc)
+            out = raw
+
+    storable = FileStorage(io.BytesIO(out), filename=file.filename,
+                           content_type=file.mimetype)
+
     from app.services.storage_service import save_image
-    url = save_image(file, ext, folder='templates')
+    url = save_image(storable, ext, folder='templates')
 
     company.template_docx_url = url
     db.session.commit()

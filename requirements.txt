@@ -8,6 +8,9 @@ charset-normalizer==3.4.7
 click==8.4.1
 colorama==0.4.6
 docx2pdf==0.1.8; platform_system != "Linux"
+# PyMuPDF : mesure des positions lors de la normalisation des modèles (template_normalizer).
+# Requis uniquement là où la normalisation Word tourne (poste/worker Windows), pas sur l'hébergeur Linux.
+PyMuPDF==1.27.2.3; platform_system != "Linux"
 Flask==3.0.3
 Flask-Bcrypt==1.0.1
 Flask-Cors==4.0.1
