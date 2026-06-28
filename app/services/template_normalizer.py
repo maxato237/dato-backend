@@ -46,11 +46,20 @@ _DIFF_THRESHOLD = 30      # delta de luminance considéré « changé »
 _ROW_MIN_PIXELS = 4       # pixels changés (échantillonnés) pour retenir une ligne/colonne
 _A4_FALLBACK_CM = (21.0, 29.7)
 
+# « Full-bleed » : un bandeau qui touche un bord de page (à FLUSH_CM près) et
+# occupe toute la largeur (ou hauteur) est étendu de BLEED_CM AU-DELÀ du bord.
+# Word rogne l'excédent (rendu inchangé), LibreOffice — qui rentre légèrement
+# une image posée pile sur le bord — remplit alors jusqu'au bord.
+_FLUSH_CM = 0.6
+_BLEED_CM = 0.6
+
 # Parties du document qui portent l'en-tête / le pied de page.
 _PART_RE = re.compile(r'word/(header|footer)\d*\.xml$')
 _DRAWING_RE = re.compile(r'<w:drawing>.*?</w:drawing>', re.S)
 _POS_H_RE = re.compile(r'<wp:positionH relativeFrom="[^"]+">.*?</wp:positionH>', re.S)
 _POS_V_RE = re.compile(r'<wp:positionV relativeFrom="[^"]+">.*?</wp:positionV>', re.S)
+_EXTENT_RE = re.compile(r'<wp:extent cx="\d+" cy="\d+"/>')
+_AEXT_RE = re.compile(r'<a:ext cx="\d+" cy="\d+"/>')
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +89,12 @@ class _Anchor:
     index: int         # n-ième dessin flottant dans cette partie
     off_h: int = 0     # offset page horizontal (EMU), rempli pendant la normalisation
     off_v: int = 0     # offset page vertical (EMU)
+    cx: int | None = None  # largeur (EMU) à forcer si débordement, sinon inchangée
+    cy: int | None = None  # hauteur (EMU) à forcer si débordement, sinon inchangée
+    region: str = 'header'  # 'header' ou 'footer' (déduit du nom de partie)
+    ext_cy_cm: float = 0.0  # hauteur nominale de l'image (cm), pour fenêtrer la mesure
+    ocx: int = 0            # largeur d'origine (EMU)
+    ocy: int = 0            # hauteur d'origine (EMU)
 
 
 def _anchored_drawings(xml: str) -> list[str]:
@@ -90,11 +105,17 @@ def _anchored_drawings(xml: str) -> list[str]:
 def _find_anchors(parts: dict[str, bytes]) -> list[_Anchor]:
     anchors: list[_Anchor] = []
     for name, data in parts.items():
-        if not _PART_RE.search(name):
+        m = _PART_RE.search(name)
+        if not m:
             continue
+        region = m.group(1)  # 'header' ou 'footer'
         xml = data.decode('utf-8')
-        for i in range(len(_anchored_drawings(xml))):
-            anchors.append(_Anchor(part=name, index=i))
+        for i, d in enumerate(_anchored_drawings(xml)):
+            ext = re.search(r'<wp:extent cx="(\d+)" cy="(\d+)"', d)
+            ocx = int(ext.group(1)) if ext else 0
+            ocy = int(ext.group(2)) if ext else 0
+            anchors.append(_Anchor(part=name, index=i, region=region,
+                                   ext_cy_cm=ocy / EMU_PER_CM, ocx=ocx, ocy=ocy))
     return anchors
 
 
@@ -117,14 +138,21 @@ def _map_nth_anchored(xml: str, n: int, transform):
     return _DRAWING_RE.sub(repl, xml)
 
 
-def _set_page_anchor(drawing: str, off_h: int, off_v: int) -> str:
-    """Force l'ancrage du dessin à la page (positions absolues)."""
+def _set_page_anchor(drawing: str, off_h: int, off_v: int,
+                     cx: int | None = None, cy: int | None = None) -> str:
+    """Force l'ancrage du dessin à la page (positions absolues).
+
+    Si ``cx``/``cy`` sont fournis, redimensionne aussi le cadre (``wp:extent``)
+    et l'image (``a:ext``) — utilisé pour faire déborder un bandeau full-bleed."""
     drawing = _POS_H_RE.sub(
         f'<wp:positionH relativeFrom="page"><wp:posOffset>{off_h}</wp:posOffset>'
         f'</wp:positionH>', drawing, count=1)
     drawing = _POS_V_RE.sub(
         f'<wp:positionV relativeFrom="page"><wp:posOffset>{off_v}</wp:posOffset>'
         f'</wp:positionV>', drawing, count=1)
+    if cx is not None and cy is not None:
+        drawing = _EXTENT_RE.sub(f'<wp:extent cx="{cx}" cy="{cy}"/>', drawing, count=1)
+        drawing = _AEXT_RE.sub(f'<a:ext cx="{cx}" cy="{cy}"/>', drawing, count=1)
     return drawing
 
 
@@ -147,7 +175,7 @@ def _variant_reanchor(parts: dict[str, bytes], anchors: list[_Anchor]) -> dict[s
         for a in lst:
             xml = _map_nth_anchored(
                 xml, a.index,
-                lambda d, a=a: _set_page_anchor(d, a.off_h, a.off_v))
+                lambda d, a=a: _set_page_anchor(d, a.off_h, a.off_v, a.cx, a.cy))
         out[part] = xml.encode('utf-8')
     return out
 
@@ -189,18 +217,25 @@ def _render_page1(parts: dict[str, bytes], dpi: int):
         return img, w_cm, h_cm
 
 
-def _visible_box_cm(full, cut, w_cm: float, h_cm: float):
+def _visible_box_cm(full, cut, w_cm: float, h_cm: float,
+                    y_lo_cm: float = 0.0, y_hi_cm: float | None = None):
     """Empreinte visible (top, left, bottom, right en cm) de l'image présente
-    dans ``full`` mais absente de ``cut`` (delete-diff)."""
+    dans ``full`` mais absente de ``cut`` (delete-diff).
+
+    La mesure est restreinte à la bande verticale [y_lo_cm, y_hi_cm] : retirer
+    une image d'en-tête/pied peut faire refluer le corps, et cette fenêtre
+    évite de capturer ce reflux (sinon la « hauteur » mesurée explose)."""
     from PIL import ImageChops
     diff = ImageChops.difference(full, cut).convert('L')
     bw = diff.point(lambda p: 255 if p > _DIFF_THRESHOLD else 0)
     W, H = bw.size
     px = bw.load()
-    rows = [y for y in range(H)
+    y0 = max(0, int(y_lo_cm / h_cm * H))
+    y1 = min(H, int((y_hi_cm if y_hi_cm is not None else h_cm) / h_cm * H))
+    rows = [y for y in range(y0, y1)
             if sum(1 for x in range(0, W, 4) if px[x, y]) >= _ROW_MIN_PIXELS]
     cols = [x for x in range(W)
-            if sum(1 for y in range(0, H, 4) if px[x, y]) >= _ROW_MIN_PIXELS]
+            if sum(1 for y in range(y0, y1, 4) if px[x, y]) >= _ROW_MIN_PIXELS]
     if not rows or not cols:
         return None
     return (min(rows) / H * h_cm, min(cols) / W * w_cm,
@@ -231,10 +266,18 @@ def normalize_letterhead(docx_bytes: bytes, *, dpi: int = 150,
 
     # 1. Cibles : position visible réelle de chaque image dans le rendu Word.
     full, w_cm, h_cm = _render_page1(parts, dpi)
+
+    def window(a: _Anchor):
+        pad = a.ext_cy_cm + 1.5  # marge autour de la hauteur nominale de l'image
+        if a.region == 'footer':
+            return (h_cm - pad, h_cm)
+        return (0.0, pad)
+
     targets = []
     for a in anchors:
+        lo, hi = window(a)
         box = _visible_box_cm(full, _render_page1(_variant_remove(parts, a), dpi)[0],
-                              w_cm, h_cm)
+                              w_cm, h_cm, lo, hi)
         targets.append(box)
         log(f'  cible {a.part}#{a.index}: {box}')
 
@@ -251,13 +294,37 @@ def normalize_letterhead(docx_bytes: bytes, *, dpi: int = 150,
     for a, box in zip(anchors, targets):
         if box is None:
             continue
+        lo, hi = window(a)
         got = _visible_box_cm(cand, _render_page1(_variant_remove(cand_parts, a), dpi)[0],
-                             w_cm, h_cm)
+                             w_cm, h_cm, lo, hi)
         if got is None:
             continue
         a.off_v += round((box[0] - got[0]) * EMU_PER_CM)
         a.off_h += round((box[1] - got[1]) * EMU_PER_CM)
         log(f'  corrige {a.part}#{a.index}: dv={box[0]-got[0]:+.2f}cm dh={box[1]-got[1]:+.2f}cm')
+
+    # 4. Full-bleed des bandeaux pleine largeur — SANS jamais étirer la hauteur
+    #    (le texte intégré au bandeau serait déformé). Le débordement vient :
+    #    - horizontalement : on CENTRE le bandeau déjà plus large que la page
+    #      (ex. 26 cm sur 21) ou, s'il n'est pas assez large, on l'élargit ;
+    #    - verticalement : si collé en haut, on le REMONTE d'un poil (décalage,
+    #      pas d'étirement). La hauteur d'origine est toujours préservée.
+    page_w_emu = round(w_cm * EMU_PER_CM)
+    min_full_w = round((w_cm + 2 * _BLEED_CM) * EMU_PER_CM)
+    for a, box in zip(anchors, targets):
+        if box is None:
+            continue
+        top, left, _bottom, right = box
+        full_width = (left <= _FLUSH_CM) and (right >= w_cm - _FLUSH_CM)
+        if not full_width:
+            continue  # bandeau inséré par design / logo : on ne déborde pas
+        a.cx = max(a.ocx, min_full_w)          # élargir seulement si nécessaire
+        a.cy = a.ocy                            # hauteur d'origine, jamais étirée
+        a.off_h = round((page_w_emu - a.cx) / 2)  # centré → déborde des 2 côtés
+        if a.region == 'header' and top <= _FLUSH_CM:
+            a.off_v = round((top - _BLEED_CM) * EMU_PER_CM)  # remonter sans étirer
+        log(f'  bleed {a.part}#{a.index}: largeur {a.cx/EMU_PER_CM:.1f}cm centrée, '
+            f'off_h={a.off_h/EMU_PER_CM:.2f}cm')
 
     return _dump(_variant_reanchor(parts, anchors))
 
